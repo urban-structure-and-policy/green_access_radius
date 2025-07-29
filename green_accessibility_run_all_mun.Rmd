@@ -1,0 +1,211 @@
+---
+title: "Green accessibility run all municipalities"
+output: html_document
+---
+
+```{r}
+library(sf)
+library(dplyr)
+library(stringr)
+library(purrr)
+```
+
+```{r start-time, echo=FALSE}
+start_time <- Sys.time()
+```
+
+## Set paths
+
+```{r}
+input_path_grid <- "insert your path here"
+input_path_green <- "insert your path here"
+output_path <- "insert your path here"
+```
+
+## Load data with names
+
+```{r}
+dat <- st_read(paste0(input_path_grid, "/strukturtypen_v4.gpkg"))
+
+# There are few cases where the spelling is different in the input data. We correct this here.
+dat_cor <- dat %>% 
+  mutate(gen = if_else(gen == "Rotenburg a.d.Fulda", "Rotenburg a. d. Fulda", gen),
+         gen = if_else(gen == "Limburg a.d.Lahn", "Limburg a. d. Lahn", gen),
+         gen = if_else(gen == "Heuchelheim a.d.Lahn", "Heuchelheim a. d. Lahn", gen),
+         gen = if_else(gen == "Breitenbach a.Herzberg", "Breitenbach a. Herzberg", gen),
+         gen = if_else(gen == "Bad Homburg v.d.Höhe", "Bad Homburg v. d. Höhe", gen),
+         gen = if_else(gen == "Rosbach v.d.Höhe", "Rosbach v. d. Höhe", gen),
+         gen = if_else(gen == "Höchst i.Odw.", "Höchst i. Odw.", gen),
+         gen = if_else(ags == "06633021", "Wesertal", gen), 
+         )
+```
+
+## Input needed to run fuction
+
+```{r}
+gem <- unique(dat_cor$gen)
+gem_files <- list.files(paste0(input_path_green, "/Vektor/Niedrigewuechsig_groesser_1ha/Niedrigewuechsig_groesser_1ha"))
+```
+
+## Define functions needed in the process
+
+```{r}
+## Get correct file
+find_gem <- function(x) {
+  file.name <- gem_files[str_detect(gem_files,paste0("\\_", str_escape(x), "\\.gpkg$"))]
+  if (length(file.name) == 0) {file.name <- "missing"}
+  file.name
+}
+
+# Intersect green
+intersect_green <- function(buffer, greentype) {
+  
+# Step 1: Perform intersection
+intersection <- st_intersection(buffer, greentype)
+
+# Step 2: Calculate area of intersections
+intersection <- intersection %>%
+  mutate(intersect_area = st_area(.))  # returns area in units of CRS (usually square meters)
+
+# Step 3: Summarize area per feature in polygons
+# Assumes polygons has a unique ID column, e.g., "id"
+area_summary <- intersection %>%
+  st_drop_geometry() %>%
+  group_by(id) %>%  
+  summarise(area_sum = sum(as.numeric(intersect_area)))
+  
+  area_summary
+  
+}
+```
+
+
+## Define function for whole process
+
+```{r}
+calculate_green_access <- function(gem, dat_zensus) {
+  
+  # Load data green
+  file <- find_gem(gem)
+  
+  if(file != "missing") {
+
+  niedrig <- st_read(paste0(input_path_green, "/Vektor/Niedrigewuechsig_groesser_1ha/Niedrigewuechsig_groesser_1ha/", file))
+  mittel <- st_read(paste0(input_path_green, "/Vektor/mittelwuechsig_groesser_1ha/mittelwuechsig_groesser_1ha/", file))
+  hoch <- st_read(paste0(input_path_green, "/Vektor/hochwuechsig_groesser_1ha/hochwuechsig_groesser_1ha/", file))
+    
+  # Reduce 700m data to larger 10 ha
+  hoch_larger10 <- hoch %>% 
+    mutate(area_ha = (as.numeric(st_area(.)))*0.0001) %>% 
+    filter(area_ha > 10)
+  mittel_larger10 <- mittel %>% 
+    mutate(area_ha = (as.numeric(st_area(.)))*0.0001) %>% 
+    filter(area_ha > 10)
+  niedrig_larger10 <- niedrig %>% 
+    mutate(area_ha = (as.numeric(st_area(.)))*0.0001) %>% 
+    filter(area_ha > 10)
+  
+  # filter zensus data to municipality
+  polygons <- dat_zensus %>% 
+    filter(gen == gem) 
+  
+  # Create 300m / 700m buffers Around Polygon Centroids
+
+  centroids <- st_centroid(polygons)
+  
+  buffers_300 <- st_buffer(centroids, dist = 300)
+  buffers_700 <- st_buffer(centroids, dist = 700)
+  
+  # Run function intersect green
+  area_hoch <- intersect_green(buffers_300, hoch)
+  area_mittel <- intersect_green(buffers_300, mittel)
+  area_niedrig <- intersect_green(buffers_300, niedrig)
+  
+  area_hoch_larger10 <- intersect_green(buffers_700, hoch_larger10)
+  area_mittel_larger10 <- intersect_green(buffers_700, mittel_larger10)
+  area_niedrig_larger10 <- intersect_green(buffers_700, niedrig_larger10)
+  
+  # join results
+  result_300 <- polygons %>% 
+  left_join(area_hoch %>% transmute(id, ha_6 = area_sum*0.0001)) %>% 
+  left_join(area_mittel %>% transmute(id, ha_5 = area_sum*0.0001)) %>% 
+  left_join(area_niedrig %>% transmute(id, ha_4 = area_sum*0.0001)) %>% 
+  mutate(ha_6 = if_else(is.na(ha_6), 0, ha_6),
+         ha_5 = if_else(is.na(ha_5), 0, ha_5),
+         ha_4 = if_else(is.na(ha_4), 0, ha_4),
+         ha_sum = ha_6 + ha_5 + ha_4,
+         ha_sum = if_else(is.na(ha_sum), 0, ha_sum))
+  
+  result_700 <- polygons %>% 
+  left_join(area_hoch_larger10 %>% transmute(id, ha_6 = area_sum*0.0001)) %>% 
+  left_join(area_mittel_larger10 %>% transmute(id, ha_5 = area_sum*0.0001)) %>% 
+  left_join(area_niedrig_larger10 %>% transmute(id, ha_4 = area_sum*0.0001)) %>% 
+  mutate(ha_6 = if_else(is.na(ha_6), 0, ha_6),
+         ha_5 = if_else(is.na(ha_5), 0, ha_5),
+         ha_4 = if_else(is.na(ha_4), 0, ha_4),
+         ha_sum = ha_6 + ha_5 + ha_4,
+         ha_sum = if_else(is.na(ha_sum), 0, ha_sum))
+  
+  # write results
+  st_write(result_300, paste0(output_path, "/GruenErr_300m_", Sys.Date(), "_", gem, ".gpkg"), delete_layer = TRUE)
+  st_write(result_700, paste0(output_path, "/GruenErr_700m_", Sys.Date(), "_", gem, ".gpkg"), delete_layer = TRUE)
+
+  }
+  
+}
+```
+
+## Run function for all municipalities
+We do not create any output, but directly write the data. 
+
+```{r}
+walk(gem, calculate_green_access, dat_zensus = dat_cor)
+
+# if you want to run only some municipalities
+# walk(gem[1:10], calculate_green_access, dat_zensus = dat_cor)
+```
+
+## Merge all outputs to one file (300m / 700m)
+
+```{r}
+
+#700m
+
+# List all gpkg files that start with "GruenErr_700m_"
+gpkg_files <- list.files(path = output_path, pattern = "^GruenErr_700m_.*\\.gpkg$", full.names = TRUE)
+
+# Read and combine all layers
+merged_data <- lapply(gpkg_files, st_read) %>%
+  bind_rows()
+
+# Define output file path
+output_gpkg <- file.path(output_path, paste(Sys.Date(),"Hessen_GruenErr_700m.gpkg", sep="-"))
+
+# Write the merged data to a new GPKG
+st_write(merged_data, output_gpkg, delete_dsn = TRUE)
+
+#300 m
+
+# List all gpkg files that start with "GruenErr_300m_"
+gpkg_files <- list.files(path = output_path, pattern = "^GruenErr_300m_.*\\.gpkg$", full.names = TRUE)
+
+# Read and combine all layers
+merged_data <- lapply(gpkg_files, st_read) %>%
+  bind_rows()
+
+# Define output file path
+output_gpkg <- file.path(output_path, paste(Sys.Date(),"Hessen_GruenErr_300m.gpkg", sep="-"))
+
+# Write the merged data to a new GPKG
+st_write(merged_data, output_gpkg, delete_dsn = TRUE)
+```
+
+
+
+```{r end-time, echo=FALSE}
+end_time <- Sys.time()
+duration <- end_time - start_time
+message("⏱️ Knitting completed in ", round(duration, 2), " ", attr(duration, "units"))
+```
+
+
